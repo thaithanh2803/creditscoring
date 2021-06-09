@@ -1,0 +1,506 @@
+---
+title: "Kalapa"
+author: "Thanh"
+output: pdf_document
+---
+
+```{r eval=FALSE, include=FALSE}
+# Set working directory
+setwd("./Credit Scoring")
+getwd()
+dir()
+```
+
+```{r eval=FALSE, include=FALSE}
+RNGkind(sample.kind = "Rounding")
+```
+
+```{r message=FALSE, warning=FALSE}
+# Exploration
+library(DataExplorer)
+library(naniar)
+library(Hmisc)
+
+# Manipulate data
+library(dplyr)
+library(stringr)
+library(tidyverse)
+library(knitr)
+library(broom)
+
+# Date and Time
+library(lubridate)
+library(tictoc)
+
+# Build model
+library(caret)
+library(caretEnsemble)
+library(rms) # Regression Modelling Strategies
+library(doSNOW)
+library(e1071)
+library(kernlab)
+library(xgboost)
+library(randomForest)
+library(glmnet)
+library(ranger)
+library(MLmetrics)
+library(scorecard)
+
+# Evaluating
+library(corrplot)
+library(pROC)
+
+# Visualization
+library(ggplot2)
+
+# Clear workspace
+rm(list=ls())
+```
+
+# 1. Input data
+
+```{r Load data}
+# Load Datasets
+original_train=read.csv("./data/train.csv",stringsAsFactors = FALSE,
+               na.strings = c(""," ","nan"),encoding = "UTF-8")
+```
+
+```{r}
+dim(original_train)
+```
+
+```{r}
+original_train$label=factor(original_train$label, levels = c(0,1), labels = c("good","bad"))
+id=original_train$id
+original_train$id= NULL
+```
+
+# 2. Feature Engineering
+
+## Remove Missing data
+
+```{r Which fields NAs more than 0.7}
+tmp=colMeans(is.na(original_train))
+tmp1=colnames(original_train)[tmp>=0.7]
+tmp1
+```
+
+```{r Drop columns with high NAs}
+dat=original_train%>%
+  select(-tmp1)
+dim(dat)
+```
+
+## Date and Time
+
+```{r Date and time fields}
+# Field 11,15,35 have been dropped
+
+DATE= c(paste0("Field_",c(5,6,7,8,9,25,32,33,40)),
+        paste0(c('F', 'E', 'C', 'G', 'A'),"_startDate"),
+        paste0(c('F', 'E', 'C', 'G', 'A'),"_endDate"))
+
+DATETIME=paste0("Field_",c(1,2,43,44))
+
+DUR=paste0(c('F', 'E', 'C', 'G', 'A'),"_duration")
+st=paste0(c('F', 'E', 'C', 'G', 'A'),"_startDate")
+en=paste0(c('F', 'E', 'C', 'G', 'A'),"_endDate")
+
+#keep=c(paste0("Field_",c(5,7,25,34,44)))
+```
+
+```{r Convert to Date format}
+dat=dat %>%
+  # Split Field_34 into 2 columns: Field_34_code and Field_34 (conver to date format 1999-01-01)
+  mutate(Field_34=substring(Field_34,1,6) %>% paste0("01") %>% ymd) %>%
+  # In file csv, all date columns have 2 Date formats: 1999-01-01 and 01/01/1999
+  # So have to convert 2 format
+  mutate(ngaySinh=parse_date_time(ngaySinh,c("ymd","mdy")) ) %>%
+  mutate_at(DATE,parse_date_time,c("ymd","mdy")) %>%
+  mutate_at(c(DATE,'ngaySinh'),as.Date)%>%
+  mutate_at(DATETIME,date) %>%
+  mutate(age=year(now())-year(ngaySinh))  %>%
+  select(-ngaySinh) # drop ngaySinh
+
+# Add A,C,G,E,F duration
+# Remove everything
+
+dat[,DUR]=dat[,en]-dat[,st]
+dat[,DUR]=sapply(dat[,DUR],as.numeric)
+
+tmp=data.frame(i=c(1, 2 ,44 ,6 ,34 ,33, 40,32 ,7, 8 ,9,  32, 8),
+               j=c(43, 1, 2, 5, 6 ,7 ,33 , 25 ,6, 7, 8 , 25, 2))
+
+for (i in  1:nrow(tmp)) {
+  each_row=tmp[i,]
+  dat[,paste0('delta',each_row[1],'_',each_row[2])]=as.numeric(dat[,paste0('Field_',each_row[1])]-
+    dat[,paste0('Field_',each_row[2])])
+}
+
+
+dat=dat %>%
+  select(-c(DATE,DATETIME,"Field_34"))
+dim(dat)
+```
+
+## Other fields transformation
+
+```{r gioiTinh}
+dat$gioiTinh=ifelse(is.na(dat$gioiTinh),dat$info_social_sex,dat$gioiTinh)
+dat = dat %>%
+  select(-info_social_sex) %>%
+  rename(gender=gioiTinh) %>%
+  mutate(gender=toupper(gender))
+dim(dat)
+```
+
+
+```{r Character fields Normalization}
+char_cols = c('diaChi', 'Field_46', 'Field_48', 'Field_49', 'Field_56', 'Field_61')
+#factor_cols = c(char_cols,
+#               paste0('Field_',c(4 ,36, 38, 45, 47,  55, 62,65 ,66, 68)),'data.basic_info.locale', 'brief')
+
+string_normalize=function(x){
+  x= x %>% trimws() %>% tolower() 
+  return(x)
+}
+
+#tmp=strsplit(dat$diaChi,split = ',')
+#dat$diaChi=sapply(tmp,function(x) x[length(x)])
+
+dat[,char_cols]=sapply(dat[,char_cols],string_normalize)
+```
+
+
+```{r}
+# Field_38, Field_62, Field_47
+dat=dat %>%
+  mutate(Field_38=case_when(
+    Field_38=='0' ~0,
+    Field_38=='1'~1,
+    Field_38 %in% c('DN','TN','GD') ~ NaN)) %>%
+  mutate(Field_62=case_when(
+    Field_62== 'I' ~ 1,
+    Field_62== 'II' ~ 2 ,
+    Field_62== 'III' ~ 3 ,
+    Field_62== 'IV' ~ 4 ,
+    Field_62== 'V' ~ 5 ,
+    Field_62== 'Ngoài qu???c doanh Qu???n ' ~ NaN)) %>%
+  mutate(Field_47=case_when(
+    Field_47== 'Zezo' ~0,
+    Field_47== 'One' ~ 1,
+    Field_47== 'Two' ~ 2,
+    Field_47== 'Three' ~ 3,
+    Field_47== 'Four' ~4))
+
+# Field_68
+
+g3=dat %>%
+  select(Field_68,label) %>%
+  mutate(label=ifelse(label=="bad",1,0)) %>%
+  group_by(Field_68) %>%
+  dplyr::summarise(count=n(),default_count=sum(label),default_rate=100*default_count/count) %>%
+  as.data.frame()
+
+
+Field68_low=g3[g3$default_rate<20,1]
+Field68_medium=g3[g3$default_rate>=20 & g3$default_rate<50,1]
+Field68_high=g3[g3$default_rate>=50,1]
+
+dat=dat %>%
+  mutate(Field_68=case_when(
+    Field_68== "MISSING" ~ "NOTFOUND",
+    Field_68 %in% Field68_low~"LOW",
+    Field_68 %in% Field68_medium~"MEDIUM",
+    Field_68 %in% Field68_high~"HIGH",
+    TRUE ~ "NOTFOUND"))
+
+# Field_45
+
+g3=dat %>%
+  select(Field_45,label) %>%
+  mutate(label=ifelse(label=="bad",1,0)) %>%
+  group_by(Field_45) %>%
+  dplyr::summarise(count=n(),default_count=sum(label),default_rate=100*default_count/count) %>%
+  as.data.frame()
+
+Field45_low=g3[g3$default_rate<20,1]
+Field45_medium=g3[g3$default_rate>=20 & g3$default_rate<50,1]
+Field45_high=g3[g3$default_rate>=20,1]
+
+dat=dat %>%
+  mutate(Field_45=case_when(
+    Field_45== "MISSING" ~ "NOTFOUND",
+    Field_45 %in% Field45_low~"LOW",
+    Field_45 %in% Field45_medium~"MEDIUM",
+    Field_45 %in% Field45_high~"HIGH",
+    TRUE ~ "NOTFOUND"))
+rm(g3)
+
+## Other columns
+
+tmp=data.frame(col1=c(27,27,41,42,51,53),
+               col2=c(20,28,39,41,50,51))
+
+for (i in  1:nrow(tmp)) {
+  each_row=tmp[i,]
+  dat[,paste0('delta',each_row[1],'_',each_row[2])]=dat[,paste0('Field_',each_row[1])]-
+    dat[,paste0('Field_',each_row[2])]
+}
+
+dat$delta59_60=dat$Field_59-dat$Field_60-2
+dim(dat)
+```
+
+
+```{r Remove some fields }
+Address.remove=c(paste0('Field_',c(48,49)),
+                 "data.basic_info.locale", "diaChi", #Remove diaChi
+                 paste0("currentLocation",c("LocationId","Latitude","Longitude")),
+                 paste0("homeTown", c("LocationId","Latitude","Longitude")))
+
+# Remove additional fields to consolidate with Sang data
+remove.fields=c(paste0("Field_",c(46,47,56,59,60,61,62)),
+                "namSinh")
+
+# Drop some columns are duplicated ref Manhitv
+ignore_columns = c(paste0("Field_",c(14, 16, 17, 24, 26, 30, 31, 37, 52, 57)),
+        'partner0_K', 'partner0_L', 
+         'partner1_B', 'partner1_D', 'partner1_E', 'partner1_F', 'partner1_K', 'partner1_L',
+         'partner2_B', 'partner2_G', 'partner2_K', 'partner2_L',
+         'partner3_B', 'partner3_C', 'partner3_F', 'partner3_G', 'partner3_H', 'partner3_K', 'partner3_L',
+        paste0('partner4_', c('A','B','C','D','E','F','G','H','K')),
+         'partner5_B', 'partner5_C', 'partner5_H', 'partner5_K', 'partner5_L')
+
+dat=dat %>%
+  select(-Address.remove,-remove.fields,-ignore_columns)
+dim(dat)
+```
+
+
+```{r Combine with Sang data}
+sang.dat=read.csv("./data/sangtrain.csv",stringsAsFactors = FALSE,
+               na.strings = c(""," ","nan"),encoding = "UTF-8")
+
+dat=dat %>%
+  mutate(currentLocationState=sang.dat$currentLocationState,
+         currentLocationCountry=sang.dat$currentLocationCountry,
+         homeTownState=sang.dat$homeTownState,
+         homeTownCountry=sang.dat$homeTownCountry,
+         maCV=sang.dat$maCv) 
+```
+
+## Conver to numerical to use in xgboost
+
+```{r}
+check.integer <- function(x){
+    test=all.equal(x,as.integer(x))
+    return(all(test==TRUE))
+}
+
+dat=dat %>%
+  mutate_if(is.character,as.factor) %>%
+  mutate_if(check.integer,as.integer) 
+
+dim(dat)
+```
+
+```{r}
+getIndexsOfColumns=function(df,column_names){
+  return(match(column_names,colnames(df)))
+}
+
+# Returns the numeric columns from a dataset
+getNumColumns=function(t){
+  tn=sapply(t,function(x) is.numeric(x))
+  return(names(tn)[which(tn)])
+}
+
+```
+
+```{r}
+categories_features=setdiff(colnames(dat),getNumColumns(dat))
+categories_features
+```
+
+```{r}
+dummies=dummyVars(label ~ Field_4 + gender  + Field_36 + Field_45 + Field_55 + Field_65 + Field_66 + Field_68 + brief + currentLocationState + currentLocationCountry + homeTownState + homeTownCountry + maCV, data=dat)
+dat_cat=predict(dummies,dat)
+new_dat=cbind(label=dat$label,dat[,-getIndexsOfColumns(dat,categories_features)],dat_cat)
+
+```
+
+```{r}
+View(new_dat[1:40,])
+```
+
+# 2. Fit model
+
+## Split data
+
+
+```{r}
+# Split data into 2 set:
+# build.dat used to select hyperparameter then build final model
+# val.dat used to compare different models and select the best one
+
+set.seed(727)
+inTrain=createDataPartition(y=new_dat$label,p=0.8,list = FALSE)
+train= new_dat[inTrain,]
+test=new_dat[-inTrain,]
+rm(inTrain)
+```
+
+## Preprocessing
+
+```{r}
+# Remove zero variance
+# medianImpute NA
+preObj=preProcess(train[,-1],
+                  method = c("zv","medianImpute","center","scale"))
+train[,-1]=predict(preObj,train[,-1])
+test[,-1]=predict(preObj,test[,-1])
+
+rm(preObj)
+dim(train)
+dim(test)
+```
+
+```{r}
+# Remove high correlation
+
+correlationMatrix <- cor(train[,-1])
+#corrplot(correlationMatrix)
+
+# find Numeric columns have high correlation
+high_corr=findCorrelation(correlationMatrix,cutoff=0.85)
+high_corr_features=colnames(train[,-1])[high_corr]
+indep_features=setdiff(names(train[,-1]),high_corr_features)
+
+# Remove high correlated columns
+train=train[,c('label',indep_features)]
+test=test[,c('label',indep_features)]
+
+
+rm(correlationMatrix,high_corr,high_corr_features,indep_features)
+dim(train)
+dim(test)
+```
+
+
+## Prepare for tuning
+
+__Metrics to evaluate model__
+
+```{r}
+# Define metric Gini
+Gini <- function(a, p) {
+  if (length(a) !=  length(p)) stop("Actual and Predicted need to be equal lengths!")
+  temp.df <- data.frame(actual = a, pred = p, range=c(1:length(a)))
+  temp.df <- temp.df[order(-temp.df$pred, temp.df$range),]
+  population.delta <- 1 / length(a)
+  total.losses <- sum(a)
+  null.losses <- rep(population.delta, length(a)) # Hopefully is similar to accumulatedPopulationPercentageSum
+  accum.losses <- temp.df$actual / total.losses # Hopefully is similar to accumulatedLossPercentageSum
+  gini.sum <- cumsum(accum.losses - null.losses) # Not sure if this is having the same effect or not
+  sum(gini.sum) / length(a)
+}
+
+normalizedGini <- function(aa, pp) {
+  Gini(aa,pp) / Gini(aa,aa)
+}
+```
+
+
+__Define trControl__
+
+```{r}
+set.seed(727)
+myFolds= createFolds(train$label,k=10)
+
+tuneControl <- trainControl(
+  index = myFolds,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE, 
+  verboseIter = FALSE,
+  savePredictions = TRUE ,
+  allowParallel = TRUE
+)
+
+fitControl=trainControl(
+  method = "none",
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE,
+  verbose=FALSE,
+  savePredictions = TRUE
+)
+
+
+```
+
+__Tune models__
+
+```{r}
+gbm_Grid=expand.grid(
+                    nrounds=c(50,100,200),
+                    max_depth = c(2,4),
+                    eta = c(0.05, 0.1),
+                    gamma =0,
+                    colsample_bytree = 0.75,
+                    subsample = 0.8,
+                    min_child_weight = 1)
+# tune xgboost
+tic()
+
+gbm_tune=train(x=train[,-1],
+                   y=as.factor(train$label),
+                   method = "xgbTree",
+                  metric = "ROC",
+                  tuneGrid=gbm_Grid,
+                  trControl = tuneControl,
+              nthread=4)
+
+
+toc()
+
+gbm_tune
+gbm_tune$bestTune
+plot(gbm_tune)
+```
+
+```{r}
+# AUC estimate and Gini estimate to see how it perform
+# CV estimate of test AUC
+max(gbm_tune$results$ROC)
+
+# test estimate of test AUC
+y.test=ifelse(test$label=="bad",1,0)
+test_preds=predict(gbm_tune,test[,-1], type="prob")[,"bad"]
+auc(response=y.test,predictor =test_preds)
+normalizedGini(aa=y.test,pp=test_preds)
+```
+
+__Fit final model__
+
+
+```r
+# best tune hyperparameters
+gbm_bestTune=gbm_tune$bestTune
+gbm_Grid=data.frame(nrounds=gbm_bestTune$nrounds,
+                     max_depth=gbm_bestTune$max_depth,
+                     eta=gbm_bestTune$eta,
+                     gamma=gbm_bestTune$gamma,
+                     colsample_bytree=gbm_bestTune$colsample_bytree,
+                     subsample=gbm_bestTune$subsample,
+                     min_child_weight=gbm_bestTune$min_child_weight)
+
+full_dat=rbind(train,test)
+gbm_fit=train(x=full_dat[,-1],
+                   y=full_dat$label,
+                   method = "xgbTree",
+                  metric = "ROC",
+                  tuneGrid=gbm_Grid,
+                  trControl = fitControl)
+
+```
+
